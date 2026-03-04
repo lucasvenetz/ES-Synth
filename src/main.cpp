@@ -14,11 +14,13 @@ struct {
   SemaphoreHandle_t mutex;
 } sysState;
 Knob knob3(0, 8, 0); // lower, upper, initial value
+Knob knob2(0, 3, 0);
 const char* currentNote = "";  
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
 SemaphoreHandle_t CAN_TX_Semaphore;
 bool isSender;
+int8_t sineTable[256];
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -101,7 +103,25 @@ void autoConfig() {
 void sampleISR(){
   static uint32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
-  int32_t Vout = (phaseAcc >> 24) - 128;
+  int32_t Vout;
+  int32_t waveform = knob2.getAtomicRotation();
+
+  switch (waveform) {
+    case 0: // sawtooth
+      Vout = (phaseAcc >> 24) - 128;
+      break;
+    case 1: // square
+      Vout = (phaseAcc >> 31) ? 127 : -128;
+      break;
+    case 2: // triangle
+      Vout = (phaseAcc >> 23) - 256;
+      if(Vout > 127) Vout = 256 - Vout;
+      break;
+    case 3: // sine
+      Vout = sineTable[phaseAcc >> 24];
+      break;
+  }
+
   int32_t localVol = knob3.getAtomicRotation();
   Vout = Vout >> (8 - localVol);
   analogWrite(OUTR_PIN, Vout + 128);
@@ -158,12 +178,16 @@ void scanKeysTask(void * pvParameters) {
 
     // Decoding knob3 rotation
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    bool A = sysState.inputs[12];
-    bool B = sysState.inputs[13];
+    bool A3 = sysState.inputs[12];
+    bool B3 = sysState.inputs[13];
+    bool A2 = sysState.inputs[14];
+    bool B2 = sysState.inputs[15];
     xSemaphoreGive(sysState.mutex);
-    knob3.updateRotation(A,B);
+    knob3.updateRotation(A3,B3);
+    knob2.updateRotation(A2,B2);
 
     uint32_t localCurrentStepSize = 0;
+    const char* localCurrentNote = ""; 
     for (int key=0; key<12; key++) {
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       bool key_pressed = !sysState.inputs[key];
@@ -175,7 +199,7 @@ void scanKeysTask(void * pvParameters) {
         TX_Message[1] = 4;
         TX_Message[2] = key;
         localCurrentStepSize = stepSizes[key];
-        currentNote = noteNames[key];
+        localCurrentNote = noteNames[key];
         stateChange = 1;
       } else if(prevKeyState[key] && !key_pressed) { /* key released */
         TX_Message[0] = 0x52;
@@ -184,7 +208,7 @@ void scanKeysTask(void * pvParameters) {
         stateChange = 1;
       } else if (key_pressed) { /* key held */
         localCurrentStepSize = stepSizes[key];
-        currentNote = noteNames[key];
+        localCurrentNote = noteNames[key];
         stateChange = 1;
       }
       if(stateChange) {
@@ -192,6 +216,7 @@ void scanKeysTask(void * pvParameters) {
           xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
         } else {
           __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+          __atomic_store_n(&currentNote, noteNames[key], __ATOMIC_RELAXED);
         }
       }
       
@@ -205,13 +230,14 @@ void updateDisplayTask(void * pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t ID;
   uint8_t localRX[8] = {0};
+  const char* waveNames[4] = {"Saw", "Square", "Triangle", "Sine"};
 
   while (1) {
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
 
     u8g2.clearBuffer();         // clear the internal memory
     u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-    u8g2.drawStr(0,10,"Helllo World!");  // write something to the internal memory
+    //u8g2.drawStr(0,10,"Helllo World!");  // write something to the internal memory
     
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     uint32_t inputSnapshot = sysState.inputs.to_ulong();
@@ -221,10 +247,19 @@ void updateDisplayTask(void * pvParameters) {
     u8g2.setCursor(2,20);
     u8g2.print(inputSnapshot, HEX);
     u8g2.setCursor(2,30);
-    u8g2.print(currentNote);
+    const char* localCurrentnote = __atomic_load_n(&currentNote, __ATOMIC_RELAXED);
+    u8g2.print(localCurrentnote);
+
+    // Volume knob
     u8g2.setCursor(66, 20);
     u8g2.print("Vol: ");
     u8g2.print(knob3.getRotation());
+
+    // waveform knob
+    u8g2.setCursor(0, 10);
+    u8g2.print("Wave: ");
+    u8g2.print(waveNames[knob2.getRotation()]);
+
     u8g2.setCursor(66,30);
     u8g2.print((char) localRX[0]);
     u8g2.print(localRX[1]);
@@ -269,7 +304,9 @@ void CAN_TX_Task (void * pvParameters) {
 }
 
 void setup() {
-  // put your setup code here, to run once:
+  for(int i = 0; i < 256; i++){
+    sineTable[i] = (int8_t)(127.0f * sin(2.0f * PI * i / 256.0f)); 
+  }
 
   //Set pin directions
   pinMode(RA0_PIN, OUTPUT);
@@ -322,6 +359,7 @@ void setup() {
   autoConfig();
   sysState.mutex = xSemaphoreCreateMutex();
   knob3.initMutex();
+  knob2.initMutex();
 
   #ifndef DISABLE_THREADS
     TaskHandle_t scanKeysHandle = NULL;
