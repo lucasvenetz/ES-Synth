@@ -5,15 +5,17 @@
 #include <ES_CAN.h>
 #include "../include/helper.hpp"
 
+#define MAX_KEYS 12
+
 // Global variables
-volatile uint32_t currentStepSize;
+volatile uint32_t currentStepSizes[MAX_KEYS] = {0};
 HardwareTimer sampleTimer(TIM1);
 struct {
   std::bitset<32> inputs;
   uint8_t RX_Message[8];
   SemaphoreHandle_t mutex;
 } sysState;
-Knob knob3(0, 8, 0); // lower, upper, initial value
+Knob knob3(0, 8, 4); // lower, upper, initial value
 Knob knob2(0, 3, 0);
 const char* currentNote = "";  
 QueueHandle_t msgInQ;
@@ -101,25 +103,38 @@ void autoConfig() {
 }
 
 void sampleISR(){
-  static uint32_t phaseAcc = 0;
-  phaseAcc += currentStepSize;
-  int32_t Vout;
+  static uint32_t phaseAcc[MAX_KEYS] = {0};
+  int32_t Vout = 0;
   int32_t waveform = knob2.getAtomicRotation();
+  int32_t activeKeyCount = 0;
 
-  switch (waveform) {
+  for (int i = 0; i < MAX_KEYS; i++) {
+    uint32_t stepSize = __atomic_load_n(&currentStepSizes[i], __ATOMIC_RELAXED);
+    phaseAcc[i] += stepSize;
+    if(stepSize == 0) continue;
+    activeKeyCount++;
+    switch (waveform) {
     case 0: // sawtooth
-      Vout = (phaseAcc >> 24) - 128;
+      Vout += (phaseAcc[i] >> 24) - 128;
       break;
     case 1: // square
-      Vout = (phaseAcc >> 31) ? 127 : -128;
+      Vout += (phaseAcc[i] >> 31) ? 127 : -128;
       break;
     case 2: // triangle
-      Vout = (phaseAcc >> 23) - 256;
-      if(Vout > 127) Vout = 256 - Vout;
+    {
+      int32_t tri = (phaseAcc[i] >> 23) - 256;
+      if(tri > 127) tri = 256 - tri;
+      Vout += tri;
       break;
+    }
     case 3: // sine
-      Vout = sineTable[phaseAcc >> 24];
+      Vout += sineTable[phaseAcc[i] >> 24];
       break;
+    }
+  }
+  // dynamically scaling vout by how many active keys there are
+  if (activeKeyCount > 1){
+    Vout = Vout / activeKeyCount;
   }
 
   int32_t localVol = knob3.getAtomicRotation();
@@ -186,41 +201,37 @@ void scanKeysTask(void * pvParameters) {
     knob3.updateRotation(A3,B3);
     knob2.updateRotation(A2,B2);
 
-    uint32_t localCurrentStepSize = 0;
+    uint32_t localStepSizes[MAX_KEYS] = {0};
     const char* localCurrentNote = ""; 
     for (int key=0; key<12; key++) {
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       bool key_pressed = !sysState.inputs[key];
       xSemaphoreGive(sysState.mutex);
-      bool stateChange = 0;
 
-      if(!prevKeyState[key] && key_pressed) { /* If prev state is unpressed and pressed now true*/
+      if(key_pressed && !prevKeyState[key]) { /* If prev state is unpressed and pressed now true*/
         TX_Message[0] = 0x50;
         TX_Message[1] = 4;
         TX_Message[2] = key;
-        localCurrentStepSize = stepSizes[key];
-        localCurrentNote = noteNames[key];
-        stateChange = 1;
-      } else if(prevKeyState[key] && !key_pressed) { /* key released */
+        if (isSender) xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+      } else if(!key_pressed && prevKeyState[key]) { /* key released */
         TX_Message[0] = 0x52;
         TX_Message[1] = 4;
         TX_Message[2] = key;
-        stateChange = 1;
-      } else if (key_pressed) { /* key held */
-        localCurrentStepSize = stepSizes[key];
-        localCurrentNote = noteNames[key];
-        stateChange = 1;
-      }
-      if(stateChange) {
-        if (isSender) {
-          xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
-        } else {
-          __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
-          __atomic_store_n(&currentNote, noteNames[key], __ATOMIC_RELAXED);
-        }
-      }
+        if (isSender) xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
+      } 
       
-      prevKeyState[key] = key_pressed; 
+      if (key_pressed) { /* key held */
+        localStepSizes[key] = stepSizes[key];
+        localCurrentNote = noteNames[key];
+      }
+
+      prevKeyState[key] = key_pressed;
+    }
+    if (!isSender) {
+      for (int i=0; i<MAX_KEYS; i++){
+      __atomic_store_n(&currentStepSizes[i], localStepSizes[i], __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&currentNote, localCurrentNote, __ATOMIC_RELAXED);
     }
   }
 }
@@ -273,11 +284,12 @@ void decodeTask(void * pvParameters) {
   uint8_t localMessage[8];
   while(1) {
     xQueueReceive(msgInQ, localMessage, portMAX_DELAY);
+    uint8_t note = localMessage[2];
+    
     if (localMessage[0] == 0x52) {
-      __atomic_store_n(&currentStepSize, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&currentStepSizes[note], 0, __ATOMIC_RELAXED);
     } else if (localMessage[0] == 0x50) {
       uint8_t octave = localMessage[1];
-      uint8_t note = localMessage[2];
       uint32_t step = stepSizes[note];
       // current board is at 4th octave
       if (octave >= 4) {
@@ -285,7 +297,7 @@ void decodeTask(void * pvParameters) {
       } else {
         step = step >> (4 - octave);
       }
-      __atomic_store_n(&currentStepSize, step, __ATOMIC_RELAXED);
+      __atomic_store_n(&currentStepSizes[note], step, __ATOMIC_RELAXED);
     }
 
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
