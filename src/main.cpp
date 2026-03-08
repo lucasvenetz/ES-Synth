@@ -7,26 +7,12 @@
 
 #define MAX_KEYS 12
 
-// Global variables
-volatile uint32_t currentStepSizes[MAX_KEYS] = {0}; // Local key scan
-volatile uint32_t remoteStepSizes[MAX_KEYS] = {0}; // Remote CAN key scan
-HardwareTimer sampleTimer(TIM1);
-struct {
-  std::bitset<32> inputs;
-  uint8_t RX_Message[8];
-  SemaphoreHandle_t mutex;
-} sysState;
-Knob knob3(0, 8, 4); // volume control (lower, upper, initial value)
-Knob knob2(0, 3, 0); // waveform control 
-Knob knob1(0, 8, 4); // octave control
-const char* currentNote = "";  
-QueueHandle_t msgInQ;
-QueueHandle_t msgOutQ;
-SemaphoreHandle_t CAN_TX_Semaphore;
-bool isSender;
-int8_t sineTable[256];
-
 //Constants
+  constexpr uint32_t FS = 22000;
+  constexpr float LOOP_SECONDS = 2.0; //Recording duration
+  constexpr uint32_t LOOP_MAX_SAMPLES = static_cast<uint32_t>(FS * LOOP_SECONDS);
+  constexpr uint32_t RECORD_COUNTDOWN_SECONDS = 3;
+  constexpr uint32_t RECORD_COUNTDOWN_SAMPLES = FS * RECORD_COUNTDOWN_SECONDS;
   const uint32_t interval = 100; //Display update interval
 
   // equal temperament (12root2) with fs=22kHz
@@ -79,6 +65,35 @@ int8_t sineTable[256];
   const int HKOW_BIT = 5;
   const int HKOE_BIT = 6;
 
+// Global variables
+  volatile int8_t loopBuffer[LOOP_MAX_SAMPLES] = {0};
+  volatile uint32_t loopLength = 0; // Valid recorded length
+  volatile uint32_t currentStepSizes[MAX_KEYS] = {0}; // Local key scan
+  volatile uint32_t remoteStepSizes[MAX_KEYS] = {0}; // Remote CAN key scan
+  HardwareTimer sampleTimer(TIM1);
+  struct {
+    std::bitset<32> inputs;
+    uint8_t RX_Message[8];
+    SemaphoreHandle_t mutex;
+  } sysState;
+  Knob knob3(0, 8, 4); // volume control (lower, upper, initial value)
+  Knob knob2(0, 3, 0); // waveform control 
+  Knob knob1(0, 8, 4); // octave control
+  Knob knob0(0, 2, 0); // sysMode control (3 modes)
+  const char* currentNote = "";  
+  QueueHandle_t msgInQ;
+  QueueHandle_t msgOutQ;
+  SemaphoreHandle_t CAN_TX_Semaphore;
+  bool isSender;
+  int8_t sineTable[256];
+  enum class sysMode : uint8_t {
+    LIVE = 0,
+    RECORD = 1,
+    PLAYBACK = 2
+  };
+  volatile uint8_t g_sysMode = static_cast<uint8_t>(sysMode::LIVE);
+  volatile uint32_t g_recordCountdownSamples = 0; 
+
 //Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
@@ -102,6 +117,23 @@ void autoConfig() {
   } else {
       isSender = false;
     }
+}
+
+inline sysMode getSysMode() {
+  return static_cast<sysMode>(__atomic_load_n(&g_sysMode, __ATOMIC_RELAXED));
+}
+
+inline void setSysMode(sysMode m) {
+  __atomic_store_n(&g_sysMode, static_cast<uint8_t>(m), __ATOMIC_RELAXED);
+}
+
+const char* loopModeToText(sysMode m) {
+  switch (m) {
+    case sysMode::LIVE:     return "LIVE"; //LIVE
+    case sysMode::RECORD:   return "RECORD"; //RECORD
+    case sysMode::PLAYBACK: return "PLAYBACK"; //PLAYBACK
+    default:                 return "?";
+  }
 }
 
 void sampleISR(){
@@ -143,6 +175,43 @@ void sampleISR(){
   // dynamically scaling vout by how many active keys there are
   if (activeKeyCount > 1){
     Vout = Vout / activeKeyCount;
+  }
+
+  static uint32_t recIdx = 0;
+  static uint32_t playIdx = 0;
+  static sysMode prevMode = sysMode::LIVE;
+  sysMode mode = getSysMode();
+
+  if (mode != prevMode) {
+    if (mode == sysMode::RECORD) {
+      recIdx = 0;
+      playIdx = 0;
+      loopLength = 0;
+      __atomic_store_n(&g_recordCountdownSamples, RECORD_COUNTDOWN_SAMPLES, __ATOMIC_RELAXED);
+    } else if (mode == sysMode::PLAYBACK) {
+      playIdx = 0;
+      __atomic_store_n(&g_recordCountdownSamples, 0, __ATOMIC_RELAXED);
+    } else {
+    __atomic_store_n(&g_recordCountdownSamples, 0, __ATOMIC_RELAXED);
+    }
+    prevMode = mode;
+  }
+
+  if (mode == sysMode::RECORD) {
+    uint32_t cd = __atomic_load_n(&g_recordCountdownSamples, __ATOMIC_RELAXED);
+    if (cd > 0) {
+      __atomic_store_n(&g_recordCountdownSamples, cd - 1, __ATOMIC_RELAXED); // Do not write to loopBuffer yet
+    } else if (recIdx < LOOP_MAX_SAMPLES) {
+      loopBuffer[recIdx++] = static_cast<int8_t>(Vout);
+      loopLength = recIdx;
+    }
+  } else if (mode == sysMode::PLAYBACK) {
+    if (loopLength > 0) {
+      Vout = loopBuffer[playIdx++];
+      if (playIdx >= loopLength) playIdx = 0;
+    } else {
+      Vout = 0;
+    }
   }
 
   int32_t localVol = knob3.getAtomicRotation();
@@ -206,11 +275,22 @@ void scanKeysTask(void * pvParameters) {
     bool knob2A = sysState.inputs[14];
     bool knob2B = sysState.inputs[15];
     bool knob1A = sysState.inputs[16];
-    bool knob1B = sysState.inputs[17]; 
+    bool knob1B = sysState.inputs[17];
+    bool knob0A = sysState.inputs[18];
+    bool knob0B = sysState.inputs[19]; 
     xSemaphoreGive(sysState.mutex);
     knob3.updateRotation(knob3A, knob3B);
     knob2.updateRotation(knob2A, knob2B);
     knob1.updateRotation(knob1A, knob1B);
+    knob0.updateRotation(knob0A, knob0B);
+
+    //  Updating the system mode //
+    static int32_t prevMode = -1;
+    int32_t modeIdx = knob0.getRotation();
+    if (modeIdx != prevMode) {
+      setSysMode(static_cast<sysMode>(modeIdx));
+      prevMode = modeIdx;
+    }
 
     uint32_t localStepSizes[MAX_KEYS] = {0};
     const char* localCurrentNote = ""; 
@@ -266,29 +346,42 @@ void updateDisplayTask(void * pvParameters) {
     memcpy(localRX, sysState.RX_Message, 8);
     xSemaphoreGive(sysState.mutex);
 
-    u8g2.setCursor(2,20);
-    u8g2.print("SYS: ");
+    // sysInput and currentNote
+    u8g2.setCursor(70,10);
+    u8g2.print("sys: ");
     u8g2.print(inputSnapshot, HEX);
     u8g2.setCursor(2,30);
     const char* localCurrentnote = __atomic_load_n(&currentNote, __ATOMIC_RELAXED);
     u8g2.print(localCurrentnote);
 
-    // Volume knob
-    u8g2.setCursor(86, 20);
-    u8g2.print("Vol: ");
-    u8g2.print(knob3.getRotation());
-
-    // waveform knob
+    // sysMode 
     u8g2.setCursor(0, 10);
-    u8g2.print("Wave: ");
-    u8g2.print(waveNames[knob2.getRotation()]);
+    sysMode mode = getSysMode();
+    uint32_t cd = __atomic_load_n(&g_recordCountdownSamples, __ATOMIC_RELAXED);
+    if (mode == sysMode::RECORD && cd > 0) {
+      uint32_t secs = (cd + FS - 1) / FS; 
+      u8g2.print("REC in ");
+      u8g2.print(secs);
+    } else {
+      u8g2.print(loopModeToText(mode));
+    }
 
-    // octave knob
-    u8g2.setCursor(86, 10);
+    // Octave knob
+    u8g2.setCursor(0, 20);
     u8g2.print("Oct: ");
     u8g2.print(knob1.getRotation());
 
-    u8g2.setCursor(86,30);
+    // Volume knob
+    u8g2.setCursor(40, 20);
+    u8g2.print("Vol: ");
+    u8g2.print(knob3.getRotation());
+
+    // Waveform knob
+    u8g2.setCursor(40, 30);
+    u8g2.print("Wave: ");
+    u8g2.print(waveNames[knob2.getRotation()]);
+
+    u8g2.setCursor(86,20);
     u8g2.print("RX: ");
     u8g2.print((char) localRX[0]);
     u8g2.print(localRX[1]);
@@ -381,7 +474,7 @@ void setup() {
   msgOutQ = xQueueCreate(36,8);
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3,3);
 
-  sampleTimer.setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer.setOverflow(FS, HERTZ_FORMAT);
   #ifndef DISABLE_ISR
     sampleTimer.attachInterrupt(sampleISR);
   #endif
@@ -392,6 +485,7 @@ void setup() {
   knob3.initMutex();
   knob2.initMutex();
   knob1.initMutex();
+  knob0.initMutex();
 
   #ifndef DISABLE_THREADS
     TaskHandle_t scanKeysHandle = NULL;
