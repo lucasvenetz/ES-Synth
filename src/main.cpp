@@ -8,7 +8,8 @@
 #define MAX_KEYS 12
 
 // Global variables
-volatile uint32_t currentStepSizes[MAX_KEYS] = {0};
+volatile uint32_t currentStepSizes[MAX_KEYS] = {0}; // Local key scan
+volatile uint32_t remoteStepSizes[MAX_KEYS] = {0}; // Remote CAN key scan
 HardwareTimer sampleTimer(TIM1);
 struct {
   std::bitset<32> inputs;
@@ -104,35 +105,39 @@ void autoConfig() {
 }
 
 void sampleISR(){
-  static uint32_t phaseAcc[MAX_KEYS] = {0};
+  static uint32_t localPhaseAcc[MAX_KEYS] = {0};
+  static uint32_t remotePhaseAcc[MAX_KEYS] = {0};
   int32_t Vout = 0;
   int32_t waveform = knob2.getAtomicRotation();
   int32_t octave = knob1.getAtomicRotation();
   int32_t activeKeyCount = 0;
 
-  for (int i = 0; i < MAX_KEYS; i++) {
-    uint32_t stepSize = __atomic_load_n(&currentStepSizes[i], __ATOMIC_RELAXED);
-    stepSize = (octave > 4) ? stepSize << (octave - 4) : stepSize >> (4 - octave);
-    phaseAcc[i] += stepSize;
-    if(stepSize == 0) continue;
-    activeKeyCount++;
+  auto sampleFromPhase = [&](uint32_t phase) -> int32_t {
     switch (waveform) {
-    case 0: // sawtooth
-      Vout += (phaseAcc[i] >> 24) - 128;
-      break;
-    case 1: // square
-      Vout += (phaseAcc[i] >> 31) ? 127 : -128;
-      break;
-    case 2: // triangle
-    {
-      int32_t tri = (phaseAcc[i] >> 23) - 256;
-      if(tri > 127) tri = 256 - tri;
-      Vout += tri;
-      break;
+      case 0: return (phase >> 24) - 128;                 // saw
+      case 1: return (phase >> 31) ? 127 : -128;          // square
+      case 2: { int32_t t = (phase >> 23) - 256;          // triangle
+                if (t > 127) t = 256 - t;
+                return t; }
+      default: return sineTable[phase >> 24];             // sine
     }
-    case 3: // sine
-      Vout += sineTable[phaseAcc[i] >> 24];
-      break;
+  };
+
+  for (int i = 0; i < MAX_KEYS; i++) {
+    uint32_t remoteStepSize = __atomic_load_n(&remoteStepSizes[i], __ATOMIC_RELAXED);
+    uint32_t localStepSize = __atomic_load_n(&currentStepSizes[i], __ATOMIC_RELAXED);
+    localStepSize = (octave >= 4) ? localStepSize << (octave - 4) : localStepSize >> (4 - octave);
+    if(localStepSize == 0 && remoteStepSize == 0) continue;
+    
+    if (localStepSize) {
+      localPhaseAcc[i] += localStepSize;
+      Vout += sampleFromPhase(localPhaseAcc[i]);
+      activeKeyCount++;
+    }
+    if (remoteStepSize) {
+      remotePhaseAcc[i] += remoteStepSize;
+      Vout += sampleFromPhase(remotePhaseAcc[i]);
+      activeKeyCount++;
     }
   }
   // dynamically scaling vout by how many active keys there are
@@ -262,13 +267,14 @@ void updateDisplayTask(void * pvParameters) {
     xSemaphoreGive(sysState.mutex);
 
     u8g2.setCursor(2,20);
+    u8g2.print("SYS: ");
     u8g2.print(inputSnapshot, HEX);
     u8g2.setCursor(2,30);
     const char* localCurrentnote = __atomic_load_n(&currentNote, __ATOMIC_RELAXED);
     u8g2.print(localCurrentnote);
 
     // Volume knob
-    u8g2.setCursor(66, 20);
+    u8g2.setCursor(86, 20);
     u8g2.print("Vol: ");
     u8g2.print(knob3.getRotation());
 
@@ -283,9 +289,11 @@ void updateDisplayTask(void * pvParameters) {
     u8g2.print(knob1.getRotation());
 
     u8g2.setCursor(86,30);
+    u8g2.print("RX: ");
     u8g2.print((char) localRX[0]);
     u8g2.print(localRX[1]);
     u8g2.print(localRX[2]);
+    
     u8g2.sendBuffer();          // transfer internal memory to the display
     digitalToggle(LED_BUILTIN);
   }
@@ -297,9 +305,9 @@ void decodeTask(void * pvParameters) {
     xQueueReceive(msgInQ, localMessage, portMAX_DELAY);
     uint8_t note = localMessage[2];
     
-    if (localMessage[0] == 0x52) {
-      __atomic_store_n(&currentStepSizes[note], 0, __ATOMIC_RELAXED);
-    } else if (localMessage[0] == 0x50) {
+    if (localMessage[0] == 0x52) { // Key released
+      __atomic_store_n(&remoteStepSizes[note], 0, __ATOMIC_RELAXED);
+    } else if (localMessage[0] == 0x50) { // Key pressed
       uint8_t octave = localMessage[1];
       uint32_t step = stepSizes[note];
       // current board is at 4th octave
@@ -308,7 +316,7 @@ void decodeTask(void * pvParameters) {
       } else {
         step = step >> (4 - octave);
       }
-      __atomic_store_n(&currentStepSizes[note], step, __ATOMIC_RELAXED);
+      __atomic_store_n(&remoteStepSizes[note], step, __ATOMIC_RELAXED);
     }
 
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
