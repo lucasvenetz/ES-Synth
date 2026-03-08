@@ -15,8 +15,9 @@ struct {
   uint8_t RX_Message[8];
   SemaphoreHandle_t mutex;
 } sysState;
-Knob knob3(0, 8, 4); // lower, upper, initial value
-Knob knob2(0, 3, 0);
+Knob knob3(0, 8, 4); // volume control (lower, upper, initial value)
+Knob knob2(0, 3, 0); // waveform control 
+Knob knob1(0, 8, 4); // octave control
 const char* currentNote = "";  
 QueueHandle_t msgInQ;
 QueueHandle_t msgOutQ;
@@ -82,14 +83,14 @@ U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
 
 //Function to set outputs using key matrix
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
-      digitalWrite(REN_PIN,LOW);
-      digitalWrite(RA0_PIN, bitIdx & 0x01);
-      digitalWrite(RA1_PIN, bitIdx & 0x02);
-      digitalWrite(RA2_PIN, bitIdx & 0x04);
-      digitalWrite(OUT_PIN,value);
-      digitalWrite(REN_PIN,HIGH);
-      delayMicroseconds(2);
-      digitalWrite(REN_PIN,LOW);
+  digitalWrite(REN_PIN,LOW);
+  digitalWrite(RA0_PIN, bitIdx & 0x01);
+  digitalWrite(RA1_PIN, bitIdx & 0x02);
+  digitalWrite(RA2_PIN, bitIdx & 0x04);
+  digitalWrite(OUT_PIN,value);
+  digitalWrite(REN_PIN,HIGH);
+  delayMicroseconds(2);
+  digitalWrite(REN_PIN,LOW);
 }
 
 void autoConfig() {
@@ -106,10 +107,12 @@ void sampleISR(){
   static uint32_t phaseAcc[MAX_KEYS] = {0};
   int32_t Vout = 0;
   int32_t waveform = knob2.getAtomicRotation();
+  int32_t octave = knob1.getAtomicRotation();
   int32_t activeKeyCount = 0;
 
   for (int i = 0; i < MAX_KEYS; i++) {
     uint32_t stepSize = __atomic_load_n(&currentStepSizes[i], __ATOMIC_RELAXED);
+    stepSize = (octave > 4) ? stepSize << (octave - 4) : stepSize >> (4 - octave);
     phaseAcc[i] += stepSize;
     if(stepSize == 0) continue;
     activeKeyCount++;
@@ -180,7 +183,7 @@ void scanKeysTask(void * pvParameters) {
   while (1) {
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
 
-    for (int row=0; row<4; row++) {
+    for (int row=0; row<5; row++) {
       setRow(row);
       delayMicroseconds(3);
       std::bitset<4> col_out = readCols();
@@ -191,15 +194,18 @@ void scanKeysTask(void * pvParameters) {
       xSemaphoreGive(sysState.mutex);
     }
 
-    // Decoding knob3 rotation
+    // Decoding knob rotations
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    bool A3 = sysState.inputs[12];
-    bool B3 = sysState.inputs[13];
-    bool A2 = sysState.inputs[14];
-    bool B2 = sysState.inputs[15];
+    bool knob3A = sysState.inputs[12];
+    bool knob3B = sysState.inputs[13];
+    bool knob2A = sysState.inputs[14];
+    bool knob2B = sysState.inputs[15];
+    bool knob1A = sysState.inputs[16];
+    bool knob1B = sysState.inputs[17]; 
     xSemaphoreGive(sysState.mutex);
-    knob3.updateRotation(A3,B3);
-    knob2.updateRotation(A2,B2);
+    knob3.updateRotation(knob3A, knob3B);
+    knob2.updateRotation(knob2A, knob2B);
+    knob1.updateRotation(knob1A, knob1B);
 
     uint32_t localStepSizes[MAX_KEYS] = {0};
     const char* localCurrentNote = ""; 
@@ -210,12 +216,12 @@ void scanKeysTask(void * pvParameters) {
 
       if(key_pressed && !prevKeyState[key]) { /* If prev state is unpressed and pressed now true*/
         TX_Message[0] = 0x50;
-        TX_Message[1] = 4;
+        TX_Message[1] = knob1.getAtomicRotation();
         TX_Message[2] = key;
         if (isSender) xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
       } else if(!key_pressed && prevKeyState[key]) { /* key released */
         TX_Message[0] = 0x52;
-        TX_Message[1] = 4;
+        TX_Message[1] = knob1.getAtomicRotation();
         TX_Message[2] = key;
         if (isSender) xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
       } 
@@ -271,7 +277,12 @@ void updateDisplayTask(void * pvParameters) {
     u8g2.print("Wave: ");
     u8g2.print(waveNames[knob2.getRotation()]);
 
-    u8g2.setCursor(66,30);
+    // octave knob
+    u8g2.setCursor(86, 10);
+    u8g2.print("Oct: ");
+    u8g2.print(knob1.getRotation());
+
+    u8g2.setCursor(86,30);
     u8g2.print((char) localRX[0]);
     u8g2.print(localRX[1]);
     u8g2.print(localRX[2]);
@@ -372,6 +383,7 @@ void setup() {
   sysState.mutex = xSemaphoreCreateMutex();
   knob3.initMutex();
   knob2.initMutex();
+  knob1.initMutex();
 
   #ifndef DISABLE_THREADS
     TaskHandle_t scanKeysHandle = NULL;
