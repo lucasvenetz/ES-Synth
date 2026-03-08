@@ -67,7 +67,9 @@
 
 // Global variables
   volatile int8_t loopBuffer[LOOP_MAX_SAMPLES] = {0};
-  volatile uint32_t loopLength = 0; // Valid recorded length
+  volatile uint32_t g_recIdx = 0;
+  volatile uint32_t g_playIdx = 0;
+  volatile uint32_t g_loopLength = 0;
   volatile uint32_t currentStepSizes[MAX_KEYS] = {0}; // Local key scan
   volatile uint32_t remoteStepSizes[MAX_KEYS] = {0}; // Remote CAN key scan
   HardwareTimer sampleTimer(TIM1);
@@ -130,7 +132,7 @@ inline void setSysMode(sysMode m) {
 const char* loopModeToText(sysMode m) {
   switch (m) {
     case sysMode::LIVE:     return "LIVE"; //LIVE
-    case sysMode::RECORD:   return "RECORD"; //RECORD
+    case sysMode::RECORD:   return "RECORDING"; //RECORD
     case sysMode::PLAYBACK: return "PLAYBACK"; //PLAYBACK
     default:                 return "?";
   }
@@ -177,19 +179,17 @@ void sampleISR(){
     Vout = Vout / activeKeyCount;
   }
 
-  static uint32_t recIdx = 0;
-  static uint32_t playIdx = 0;
   static sysMode prevMode = sysMode::LIVE;
   sysMode mode = getSysMode();
 
   if (mode != prevMode) {
     if (mode == sysMode::RECORD) {
-      recIdx = 0;
-      playIdx = 0;
-      loopLength = 0;
+      __atomic_store_n(&g_recIdx, 0, __ATOMIC_RELAXED);      
+      __atomic_store_n(&g_playIdx, 0, __ATOMIC_RELAXED); 
+      __atomic_store_n(&g_loopLength, 0, __ATOMIC_RELAXED); 
       __atomic_store_n(&g_recordCountdownSamples, RECORD_COUNTDOWN_SAMPLES, __ATOMIC_RELAXED);
     } else if (mode == sysMode::PLAYBACK) {
-      playIdx = 0;
+      __atomic_store_n(&g_playIdx, 0, __ATOMIC_RELAXED); 
       __atomic_store_n(&g_recordCountdownSamples, 0, __ATOMIC_RELAXED);
     } else {
     __atomic_store_n(&g_recordCountdownSamples, 0, __ATOMIC_RELAXED);
@@ -197,18 +197,24 @@ void sampleISR(){
     prevMode = mode;
   }
 
+  uint32_t cd = __atomic_load_n(&g_recordCountdownSamples, __ATOMIC_RELAXED);
+  uint32_t localRecIdx = __atomic_load_n(&g_recIdx, __ATOMIC_RELAXED);
+  uint32_t localLoopLength = __atomic_load_n(&g_loopLength, __ATOMIC_RELAXED);
+  uint32_t localplayIdx = __atomic_load_n(&g_playIdx, __ATOMIC_RELAXED);
   if (mode == sysMode::RECORD) {
-    uint32_t cd = __atomic_load_n(&g_recordCountdownSamples, __ATOMIC_RELAXED);
-    if (cd > 0) {
+    if (cd > 0) { // Still waiting for countdown
       __atomic_store_n(&g_recordCountdownSamples, cd - 1, __ATOMIC_RELAXED); // Do not write to loopBuffer yet
-    } else if (recIdx < LOOP_MAX_SAMPLES) {
-      loopBuffer[recIdx++] = static_cast<int8_t>(Vout);
-      loopLength = recIdx;
+    } else if (localRecIdx < LOOP_MAX_SAMPLES) { // Start recording
+      Vout = constrain(Vout, -128, 127);
+      loopBuffer[localRecIdx++] = static_cast<int8_t>(Vout);
+      __atomic_store_n(&g_recIdx, localRecIdx, __ATOMIC_RELAXED);
+      __atomic_store_n(&g_loopLength, localRecIdx, __ATOMIC_RELAXED);
     }
   } else if (mode == sysMode::PLAYBACK) {
-    if (loopLength > 0) {
-      Vout = loopBuffer[playIdx++];
-      if (playIdx >= loopLength) playIdx = 0;
+    if (localLoopLength > 0) {
+      Vout = loopBuffer[localplayIdx++];
+      if (localplayIdx >= localLoopLength) localplayIdx = 0;
+      __atomic_store_n(&g_playIdx, localplayIdx, __ATOMIC_RELAXED);
     } else {
       Vout = 0;
     }
@@ -347,9 +353,9 @@ void updateDisplayTask(void * pvParameters) {
     xSemaphoreGive(sysState.mutex);
 
     // sysInput and currentNote
-    u8g2.setCursor(70,10);
-    u8g2.print("sys: ");
-    u8g2.print(inputSnapshot, HEX);
+    // u8g2.setCursor(70,10);
+    // u8g2.print("sys: ");
+    // u8g2.print(inputSnapshot, HEX);
     u8g2.setCursor(2,30);
     const char* localCurrentnote = __atomic_load_n(&currentNote, __ATOMIC_RELAXED);
     u8g2.print(localCurrentnote);
@@ -358,12 +364,45 @@ void updateDisplayTask(void * pvParameters) {
     u8g2.setCursor(0, 10);
     sysMode mode = getSysMode();
     uint32_t cd = __atomic_load_n(&g_recordCountdownSamples, __ATOMIC_RELAXED);
+    uint32_t recIdx = __atomic_load_n(&g_recIdx, __ATOMIC_RELAXED);
+    uint32_t playIdx = __atomic_load_n(&g_playIdx, __ATOMIC_RELAXED);
+    uint32_t loopLen = __atomic_load_n(&g_loopLength, __ATOMIC_RELAXED);
     if (mode == sysMode::RECORD && cd > 0) {
       uint32_t secs = (cd + FS - 1) / FS; 
-      u8g2.print("REC in ");
+      u8g2.print("Recording in ");
       u8g2.print(secs);
     } else {
       u8g2.print(loopModeToText(mode));
+    }
+
+    const uint8_t dotStartX = 88;
+    const uint8_t dotY = 5;
+    const uint8_t dotSpacing = 6;
+    const uint8_t dotRadius = 2;
+    const uint8_t dotCount = 6;
+    for (uint8_t i = 0; i < dotCount; i++) {
+      u8g2.drawCircle(dotStartX + i * dotSpacing, dotY, dotRadius);
+    }
+
+    if (mode == sysMode::RECORD && cd > 0) {
+      uint8_t countdownDots = static_cast<uint8_t>((cd + FS - 1) / FS);
+      if (countdownDots > 3) countdownDots = 3;
+      for (uint8_t i = 0; i < countdownDots; i++) {
+        u8g2.drawDisc(dotStartX + i * dotSpacing, dotY, dotRadius);
+      }
+    } else if (mode == sysMode::RECORD) {
+      uint32_t remaining = (LOOP_MAX_SAMPLES > recIdx) ? (LOOP_MAX_SAMPLES - recIdx) : 0;
+      uint8_t remainingDots = static_cast<uint8_t>((remaining * dotCount + LOOP_MAX_SAMPLES - 1) / LOOP_MAX_SAMPLES);
+      if (remainingDots > dotCount) remainingDots = dotCount;
+      for (uint8_t i = 0; i < remainingDots; i++) {
+        u8g2.drawDisc(dotStartX + i * dotSpacing, dotY, dotRadius);
+      }
+    } else if (mode == sysMode::PLAYBACK) {
+      if (loopLen > 0) {
+        uint8_t pos = static_cast<uint8_t>((playIdx * dotCount) / loopLen);
+        if (pos >= dotCount) pos = dotCount - 1;
+        u8g2.drawDisc(dotStartX + pos * dotSpacing, dotY, dotRadius);
+      }
     }
 
     // Octave knob
