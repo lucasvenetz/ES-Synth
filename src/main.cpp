@@ -3,6 +3,7 @@
 #include <bitset>
 #include <STM32FreeRTOS.h>
 #include <ES_CAN.h>
+#include <Wire.h>
 #include "../include/helper.hpp"
 
 #define MAX_KEYS 12
@@ -79,13 +80,15 @@
     SemaphoreHandle_t mutex;
   } sysState;
   Knob knob3(0, 8, 4); // volume control (lower, upper, initial value)
-  Knob knob2(0, 3, 0); // waveform control 
+  Knob knob2(0, 3, 0); // waveform control
   Knob knob1(0, 8, 4); // octave control
   Knob knob0(0, 2, 0); // sysMode control (3 modes)
-  const char* currentNote = "";  
+  const char* currentNote = "";
   QueueHandle_t msgInQ;
   QueueHandle_t msgOutQ;
   SemaphoreHandle_t CAN_TX_Semaphore;
+  SemaphoreHandle_t i2cMutex;
+  SemaphoreHandle_t knobSemaphore;
   bool isSender;
   int8_t sineTable[256];
   enum class sysMode : uint8_t {
@@ -94,7 +97,7 @@
     PLAYBACK = 2
   };
   volatile uint8_t g_sysMode = static_cast<uint8_t>(sysMode::LIVE);
-  volatile uint32_t g_recordCountdownSamples = 0; 
+  volatile uint32_t g_recordCountdownSamples = 0;
 
 //Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
@@ -162,7 +165,7 @@ void sampleISR(){
     uint32_t localStepSize = __atomic_load_n(&currentStepSizes[i], __ATOMIC_RELAXED);
     localStepSize = (octave >= 4) ? localStepSize << (octave - 4) : localStepSize >> (4 - octave);
     if(localStepSize == 0 && remoteStepSize == 0) continue;
-    
+
     if (localStepSize) {
       localPhaseAcc[i] += localStepSize;
       Vout += sampleFromPhase(localPhaseAcc[i]);
@@ -184,12 +187,12 @@ void sampleISR(){
 
   if (mode != prevMode) {
     if (mode == sysMode::RECORD) {
-      __atomic_store_n(&g_recIdx, 0, __ATOMIC_RELAXED);      
-      __atomic_store_n(&g_playIdx, 0, __ATOMIC_RELAXED); 
-      __atomic_store_n(&g_loopLength, 0, __ATOMIC_RELAXED); 
+      __atomic_store_n(&g_recIdx, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&g_playIdx, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&g_loopLength, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&g_recordCountdownSamples, RECORD_COUNTDOWN_SAMPLES, __ATOMIC_RELAXED);
     } else if (mode == sysMode::PLAYBACK) {
-      __atomic_store_n(&g_playIdx, 0, __ATOMIC_RELAXED); 
+      __atomic_store_n(&g_playIdx, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&g_recordCountdownSamples, 0, __ATOMIC_RELAXED);
     } else {
     __atomic_store_n(&g_recordCountdownSamples, 0, __ATOMIC_RELAXED);
@@ -249,8 +252,61 @@ void setRow(uint8_t rowIdx){
   digitalWrite(REN_PIN,LOW);
   digitalWrite(RA0_PIN, rowIdx & 0x01);
   digitalWrite(RA1_PIN, rowIdx & 0x02);
-  digitalWrite(RA2_PIN, rowIdx & 0x04); 
-  digitalWrite(REN_PIN,HIGH);
+  digitalWrite(RA2_PIN, rowIdx & 0x04);
+  if (rowIdx == 2)
+    digitalWrite(OUT_PIN, LOW);
+  else
+    digitalWrite(OUT_PIN, HIGH);
+  digitalWrite(REN_PIN, HIGH);
+}
+
+void knobISR() {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  xSemaphoreGiveFromISR(knobSemaphore, &xHigherPriorityTaskWoken);
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void knobTask(void * pvParameters) {
+  while (1) {
+    xSemaphoreTake(knobSemaphore, portMAX_DELAY);
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
+
+    Wire.beginTransmission(0x21);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    Wire.requestFrom(0x21, (uint8_t)1);
+    uint8_t pcalData = 0xFF;
+    while (Wire.available()) pcalData = Wire.read();
+
+    xSemaphoreGive(i2cMutex);
+
+    // 4. Extract individual A/B signals
+    // PCAL pin assignment:
+    //   P0 = Knob3A, P1 = Knob3B
+    //   P2 = Knob2A, P3 = Knob2B
+    //   P4 = Knob1A, P5 = Knob1B
+    //   P6 = Knob0A, P7 = Knob0B
+    bool k3A = (pcalData >> 0) & 1;
+    bool k3B = (pcalData >> 1) & 1;
+    bool k2A = (pcalData >> 2) & 1;
+    bool k2B = (pcalData >> 3) & 1;
+    bool k1A = (pcalData >> 4) & 1;
+    bool k1B = (pcalData >> 5) & 1;
+    bool k0A = (pcalData >> 6) & 1;
+    bool k0B = (pcalData >> 7) & 1;
+
+    knob3.updateRotation(k3A, k3B);
+    knob2.updateRotation(k2A, k2B);
+    knob1.updateRotation(k1A, k1B);
+    knob0.updateRotation(k0A, k0B);
+
+    static int32_t prevMode = -1;
+    int32_t modeIdx = knob0.getRotation();
+    if (modeIdx != prevMode) {
+      setSysMode(static_cast<sysMode>(modeIdx));
+      prevMode = modeIdx;
+    }
+  }
 }
 
 void scanKeysTask(void * pvParameters) {
@@ -263,7 +319,7 @@ void scanKeysTask(void * pvParameters) {
   while (1) {
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
 
-    for (int row=0; row<5; row++) {
+    for (int row=0; row<3; row++) {
       setRow(row);
       delayMicroseconds(3);
       std::bitset<4> col_out = readCols();
@@ -274,32 +330,8 @@ void scanKeysTask(void * pvParameters) {
       xSemaphoreGive(sysState.mutex);
     }
 
-    // Decoding knob rotations
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);
-    bool knob3A = sysState.inputs[12];
-    bool knob3B = sysState.inputs[13];
-    bool knob2A = sysState.inputs[14];
-    bool knob2B = sysState.inputs[15];
-    bool knob1A = sysState.inputs[16];
-    bool knob1B = sysState.inputs[17];
-    bool knob0A = sysState.inputs[18];
-    bool knob0B = sysState.inputs[19]; 
-    xSemaphoreGive(sysState.mutex);
-    knob3.updateRotation(knob3A, knob3B);
-    knob2.updateRotation(knob2A, knob2B);
-    knob1.updateRotation(knob1A, knob1B);
-    knob0.updateRotation(knob0A, knob0B);
-
-    //  Updating the system mode //
-    static int32_t prevMode = -1;
-    int32_t modeIdx = knob0.getRotation();
-    if (modeIdx != prevMode) {
-      setSysMode(static_cast<sysMode>(modeIdx));
-      prevMode = modeIdx;
-    }
-
     uint32_t localStepSizes[MAX_KEYS] = {0};
-    const char* localCurrentNote = ""; 
+    const char* localCurrentNote = "";
     for (int key=0; key<12; key++) {
       xSemaphoreTake(sysState.mutex, portMAX_DELAY);
       bool key_pressed = !sysState.inputs[key];
@@ -315,8 +347,8 @@ void scanKeysTask(void * pvParameters) {
         TX_Message[1] = knob1.getAtomicRotation();
         TX_Message[2] = key;
         if (isSender) xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
-      } 
-      
+      }
+
       if (key_pressed) { /* key held */
         localStepSizes[key] = stepSizes[key];
         localCurrentNote = noteNames[key];
@@ -346,7 +378,7 @@ void updateDisplayTask(void * pvParameters) {
     u8g2.clearBuffer();         // clear the internal memory
     u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
     //u8g2.drawStr(0,10,"Helllo World!");  // write something to the internal memory
-    
+
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);
     uint32_t inputSnapshot = sysState.inputs.to_ulong();
     memcpy(localRX, sysState.RX_Message, 8);
@@ -360,7 +392,7 @@ void updateDisplayTask(void * pvParameters) {
     const char* localCurrentnote = __atomic_load_n(&currentNote, __ATOMIC_RELAXED);
     u8g2.print(localCurrentnote);
 
-    // sysMode 
+    // sysMode
     u8g2.setCursor(0, 10);
     sysMode mode = getSysMode();
     uint32_t cd = __atomic_load_n(&g_recordCountdownSamples, __ATOMIC_RELAXED);
@@ -368,7 +400,7 @@ void updateDisplayTask(void * pvParameters) {
     uint32_t playIdx = __atomic_load_n(&g_playIdx, __ATOMIC_RELAXED);
     uint32_t loopLen = __atomic_load_n(&g_loopLength, __ATOMIC_RELAXED);
     if (mode == sysMode::RECORD && cd > 0) {
-      uint32_t secs = (cd + FS - 1) / FS; 
+      uint32_t secs = (cd + FS - 1) / FS;
       u8g2.print("Recording in ");
       u8g2.print(secs);
     } else {
@@ -425,8 +457,11 @@ void updateDisplayTask(void * pvParameters) {
     u8g2.print((char) localRX[0]);
     u8g2.print(localRX[1]);
     u8g2.print(localRX[2]);
-    
+
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
     u8g2.sendBuffer();          // transfer internal memory to the display
+    xSemaphoreGive(i2cMutex);
+
     digitalToggle(LED_BUILTIN);
   }
 }
@@ -436,7 +471,7 @@ void decodeTask(void * pvParameters) {
   while(1) {
     xQueueReceive(msgInQ, localMessage, portMAX_DELAY);
     uint8_t note = localMessage[2];
-    
+
     if (localMessage[0] == 0x52) { // Key released
       __atomic_store_n(&remoteStepSizes[note], 0, __ATOMIC_RELAXED);
     } else if (localMessage[0] == 0x50) { // Key pressed
@@ -468,7 +503,7 @@ void CAN_TX_Task (void * pvParameters) {
 
 void setup() {
   for(int i = 0; i < 256; i++){
-    sineTable[i] = (int8_t)(127.0f * sin(2.0f * PI * i / 256.0f)); 
+    sineTable[i] = (int8_t)(127.0f * sin(2.0f * PI * i / 256.0f));
   }
 
   //Set pin directions
@@ -487,6 +522,7 @@ void setup() {
   pinMode(C3_PIN, INPUT);
   pinMode(JOYX_PIN, INPUT);
   pinMode(JOYY_PIN, INPUT);
+  pinMode(PA10, INPUT);
 
   //Initialise display
   setOutMuxBit(DRST_BIT, LOW);  //Assert display logic reset
@@ -494,7 +530,7 @@ void setup() {
   setOutMuxBit(DRST_BIT, HIGH);  //Release display logic reset
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
-  setOutMuxBit(KNOB_MODE, HIGH);  //Read knobs through key matrix
+  setOutMuxBit(KNOB_MODE, LOW);  //Read knobs through key matrix
 
   //Initialise UART
   Serial.begin(9600);
@@ -525,6 +561,47 @@ void setup() {
   knob2.initMutex();
   knob1.initMutex();
   knob0.initMutex();
+
+  i2cMutex = xSemaphoreCreateMutex();
+  knobSemaphore = xSemaphoreCreateBinary();
+
+  Wire.begin();
+
+  // Configure PCAL6408A
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+
+  Wire.beginTransmission(0x21);
+  Wire.write(0x03); Wire.write(0xFF);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x21);
+  Wire.write(0x43); Wire.write(0xFF);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x21);
+  Wire.write(0x44); Wire.write(0xFF);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x21);
+  Wire.write(0x42); Wire.write(0xFF);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x21);
+  Wire.write(0x45); Wire.write(0x00);
+  Wire.endTransmission();
+
+  // Clear any pending interrupt before attaching ISR
+  Wire.beginTransmission(0x21);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  Wire.requestFrom(0x21, (uint8_t)1);
+  while (Wire.available()) Wire.read();
+
+  xSemaphoreGive(i2cMutex);
+
+  attachInterrupt(digitalPinToInterrupt(PA10), knobISR, FALLING);
+
+  xTaskCreate(knobTask, "knobTask", 128, NULL, 3, NULL);
 
   #ifndef DISABLE_THREADS
     TaskHandle_t scanKeysHandle = NULL;
@@ -560,5 +637,5 @@ void setup() {
 }
 
 void loop() {
-  return; 
+  return;
 }
