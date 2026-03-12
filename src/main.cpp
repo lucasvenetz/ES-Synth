@@ -99,8 +99,65 @@
   volatile uint8_t g_sysMode = static_cast<uint8_t>(sysMode::LIVE);
   volatile uint32_t g_recordCountdownSamples = 0;
 
+  // ATTACK_RATE  : how fast amplitude rises
+  // DECAY_RATE   : how fast amplitude falls
+  // SUSTAIN_LEVEL: amplitude held while key down after decay
+  // RELEASE_RATE : how fast amplitude falls after key release
+  constexpr uint16_t FP_ONE       = 4096;
+  constexpr uint16_t ATTACK_INC   = max(1u, (unsigned)(FP_ONE / (0.01f  * FS))); // per sample
+  constexpr uint32_t DECAY_PERIOD = (uint32_t)((5.0f * FS) / (FP_ONE * (1.0f - 0.1f)));
+  constexpr uint16_t SUSTAIN_FP   = (uint16_t)(0.3f * FP_ONE);  // = 410
+  constexpr uint16_t RELEASE_DEC  = max(1u, (unsigned)(FP_ONE / (0.3f   * FS)));
+
+  volatile uint16_t envAmp[MAX_KEYS] = {0};
+  volatile uint16_t remoteEnvAmp[MAX_KEYS] = {0};
+  volatile uint8_t envStage[MAX_KEYS] = {0};
+  volatile uint8_t remoteEnvStage[MAX_KEYS] = {0};
+
+  enum class EnvStage : uint8_t { IDLE, ATTACK, DECAY, SUSTAIN, RELEASE };
+
 //Display driver object
 U8G2_SSD1305_128X32_ADAFRUIT_F_HW_I2C u8g2(U8G2_R0);
+
+inline uint16_t stepEnvelope(volatile uint16_t& amp, volatile uint8_t& stage) {
+  EnvStage s = static_cast<EnvStage>(stage);
+  switch (s) {
+    case EnvStage::ATTACK:
+      if (amp + ATTACK_INC >= FP_ONE) {
+        amp = FP_ONE;
+        stage = static_cast<uint8_t>(EnvStage::DECAY);
+      } else {
+        amp += ATTACK_INC;
+      }
+      break;
+    case EnvStage::DECAY: {
+      static uint32_t decayCounter = 0;
+      if (++decayCounter >= DECAY_PERIOD) {
+        decayCounter = 0;
+        if (amp <= SUSTAIN_FP + 1) {
+          amp = SUSTAIN_FP;
+          stage = static_cast<uint8_t>(EnvStage::SUSTAIN);
+        } else {
+          amp -= 1;
+        }
+      }
+      break;
+    }
+    case EnvStage::SUSTAIN:
+      break;
+    case EnvStage::RELEASE:
+      if (amp <= RELEASE_DEC) {
+        amp = 0;
+        stage = static_cast<uint8_t>(EnvStage::IDLE);
+      } else {
+        amp -= RELEASE_DEC;
+      }
+      break;
+    default:
+      break;
+  }
+  return amp;
+}
 
 //Function to set outputs using key matrix
 void setOutMuxBit(const uint8_t bitIdx, const bool value) {
@@ -144,6 +201,8 @@ const char* loopModeToText(sysMode m) {
 void sampleISR(){
   static uint32_t localPhaseAcc[MAX_KEYS] = {0};
   static uint32_t remotePhaseAcc[MAX_KEYS] = {0};
+  static uint32_t localLastStep[MAX_KEYS] = {0};
+  static uint32_t remoteLastStep[MAX_KEYS] = {0};
   int32_t Vout = 0;
   int32_t waveform = knob2.getAtomicRotation();
   int32_t octave = knob1.getAtomicRotation();
@@ -164,22 +223,41 @@ void sampleISR(){
     uint32_t remoteStepSize = __atomic_load_n(&remoteStepSizes[i], __ATOMIC_RELAXED);
     uint32_t localStepSize = __atomic_load_n(&currentStepSizes[i], __ATOMIC_RELAXED);
     localStepSize = (octave >= 4) ? localStepSize << (octave - 4) : localStepSize >> (4 - octave);
-    if(localStepSize == 0 && remoteStepSize == 0) continue;
 
-    if (localStepSize) {
-      localPhaseAcc[i] += localStepSize;
-      Vout += sampleFromPhase(localPhaseAcc[i]);
-      activeKeyCount++;
+    uint16_t localGain = stepEnvelope(envAmp[i], envStage[i]);
+    EnvStage localStage = static_cast<EnvStage>(envStage[i]);
+
+    // Cache the step size while the key is held
+    if (localStepSize) localLastStep[i] = localStepSize;
+
+    // Use cached step during release so the oscillator keeps running
+    uint32_t effectiveLocalStep = localStepSize;
+    if (localStage == EnvStage::RELEASE) effectiveLocalStep = localLastStep[i];
+
+    if (effectiveLocalStep || localStage != EnvStage::IDLE) {
+      localPhaseAcc[i] += effectiveLocalStep;
+      int32_t sample = sampleFromPhase(localPhaseAcc[i]);
+      Vout += (sample * localGain) >> 12;
+    } else {
+      localPhaseAcc[i] = 0;
+      localLastStep[i] = 0;
     }
-    if (remoteStepSize) {
-      remotePhaseAcc[i] += remoteStepSize;
-      Vout += sampleFromPhase(remotePhaseAcc[i]);
-      activeKeyCount++;
+
+    uint16_t remoteGain = stepEnvelope(remoteEnvAmp[i], remoteEnvStage[i]);
+    EnvStage remoteStage = static_cast<EnvStage>(remoteEnvStage[i]);
+
+    if (remoteStepSize) remoteLastStep[i] = remoteStepSize;
+    uint32_t effectiveRemoteStep = remoteStepSize;
+    if (remoteStage == EnvStage::RELEASE) effectiveRemoteStep = remoteLastStep[i];
+
+    if (effectiveRemoteStep || remoteStage != EnvStage::IDLE) {
+      remotePhaseAcc[i] += effectiveRemoteStep;
+      int32_t sample = sampleFromPhase(remotePhaseAcc[i]);
+      Vout += (sample * remoteGain) >> 12;
+    } else {
+      remotePhaseAcc[i] = 0;
+      remoteLastStep[i] = 0;
     }
-  }
-  // dynamically scaling vout by how many active keys there are
-  if (activeKeyCount > 1){
-    Vout = Vout / activeKeyCount;
   }
 
   static sysMode prevMode = sysMode::LIVE;
@@ -338,11 +416,17 @@ void scanKeysTask(void * pvParameters) {
       xSemaphoreGive(sysState.mutex);
 
       if(key_pressed && !prevKeyState[key]) { /* If prev state is unpressed and pressed now true*/
+        __atomic_store_n(&envStage[key],
+        static_cast<uint8_t>(EnvStage::ATTACK), __ATOMIC_RELAXED);
+
         TX_Message[0] = 0x50;
         TX_Message[1] = knob1.getAtomicRotation();
         TX_Message[2] = key;
         if (isSender) xQueueSend(msgOutQ, TX_Message, portMAX_DELAY);
       } else if(!key_pressed && prevKeyState[key]) { /* key released */
+        __atomic_store_n(&envStage[key],
+        static_cast<uint8_t>(EnvStage::RELEASE), __ATOMIC_RELAXED);
+
         TX_Message[0] = 0x52;
         TX_Message[1] = knob1.getAtomicRotation();
         TX_Message[2] = key;
@@ -356,12 +440,10 @@ void scanKeysTask(void * pvParameters) {
 
       prevKeyState[key] = key_pressed;
     }
-    if (!isSender) {
-      for (int i=0; i<MAX_KEYS; i++){
+    for (int i=0; i<MAX_KEYS; i++){
       __atomic_store_n(&currentStepSizes[i], localStepSizes[i], __ATOMIC_RELAXED);
     }
     __atomic_store_n(&currentNote, localCurrentNote, __ATOMIC_RELAXED);
-    }
   }
 }
 
@@ -474,6 +556,8 @@ void decodeTask(void * pvParameters) {
 
     if (localMessage[0] == 0x52) { // Key released
       __atomic_store_n(&remoteStepSizes[note], 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&remoteEnvStage[note],
+      static_cast<uint8_t>(EnvStage::RELEASE), __ATOMIC_RELAXED);
     } else if (localMessage[0] == 0x50) { // Key pressed
       uint8_t octave = localMessage[1];
       uint32_t step = stepSizes[note];
@@ -484,6 +568,8 @@ void decodeTask(void * pvParameters) {
         step = step >> (4 - octave);
       }
       __atomic_store_n(&remoteStepSizes[note], step, __ATOMIC_RELAXED);
+      __atomic_store_n(&remoteEnvStage[note],
+      static_cast<uint8_t>(EnvStage::ATTACK), __ATOMIC_RELAXED);
     }
 
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);

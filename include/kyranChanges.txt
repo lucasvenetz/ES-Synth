@@ -1,0 +1,27 @@
+PCAL6408A Knob Improvement (v2 Board)
+
+The original knob reading method scanned the key matrix at a fixed 20ms interval,
+meaning knob changes could only be detected at 50Hz regardless of how fast the user turned them.
+This created laggy, inaccurate knob response and wasted CPU time polling inputs that hadn't changed.
+The V2 board adds a PCAL6408A I2C GPIO expander connected directly to all four knob quadrature outputs.
+Rather than polling, an interrupt line (PA10) is asserted whenever any knob input changes state.
+On the software side, a dedicated knobTask thread blocks on a binary semaphore. When a knob moves,
+the PCAL interrupt fires knobISR, which gives the semaphore and wakes the thread. The thread then acquires an I2C mutex,
+reads all eight knob pin states from the PCAL in a single transaction, releases the mutex, and passes the A/B signals into
+the existing Knob::updateRotation decoder. The I2C mutex is shared with updateDisplayTask, which holds it during u8g2.sendBuffer().
+Since knobTask runs at higher priority than the display task, it will preempt the display refresh as soon as the mutex is released
+between internal I2C transactions, keeping knob latency low even during screen updates. The result is that knob changes are processed
+immediately on hardware interrupt rather than at a fixed poll rate, improving responsiveness while reducing unnecessary CPU usage.
+
+
+Envelope
+
+An ADSR (Attack, Decay, Sustain, Release) envelope was implemented to shape the amplitude of each note over time,
+replacing the previous behaviour where notes played at constant full volume from key press to key release.
+When a key is pressed the note attacks to full volume over 10ms, then decays gradually over 5 seconds down to 10%
+of full volume where it sustains for as long as the key is held. When the key is released the note fades to silence
+over 300ms rather than cutting off abruptly. Each of the 12 keys has its own independent amplitude value and stage,
+stored as fixed-point integers to avoid floating-point arithmetic inside the ISR. The envelope is advanced one step
+per sample inside sampleISR by multiplying the raw waveform output by the current amplitude before summing into the
+output. Stage transitions are triggered by key press and release events in scanKeysTask and decodeTask via atomic
+stores, which are safely read by sampleISR without a mutex since single-byte writes are atomic.
